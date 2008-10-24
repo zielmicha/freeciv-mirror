@@ -197,6 +197,8 @@ static void handle_readline_input_callback(char *line)
 *****************************************************************************/
 void close_connection(struct connection *pconn)
 {
+  cancel_connection_votes(pconn);
+
   while (timer_list_size(pconn->server.ping_timers) > 0) {
     struct timer *timer = timer_list_get(pconn->server.ping_timers, 0);
 
@@ -491,7 +493,7 @@ enum server_events server_sniff_all_input(void)
 	  if (time(NULL) > last_noplayers + srvarg.quitidle) {
 	    save_game_auto("Lost all connections");
 	    set_meta_message_string(N_("restarting for lack of players"));
-	    freelog(LOG_NORMAL, Q_(get_meta_message_string()));
+	    freelog(LOG_NORMAL, "%s", Q_(get_meta_message_string()));
 	    (void) send_server_info_to_metaserver(META_INFO);
 
             set_server_state(S_S_OVER);
@@ -711,7 +713,8 @@ enum server_events server_sniff_all_input(void)
       if (didget >= 1) {
         buffer[didget-1] = '\0'; /* overwrite newline character */
         didget--;
-        freelog(LOG_DEBUG, "Got line: \"%s\" (%ld, %ld)", buffer, didget, len);
+        freelog(LOG_DEBUG, "Got line: \"%s\" (%ld, %ld)", buffer,
+                (long int) didget, (long int) len);
       }
 #else  /* HAVE_GETLINE */
       buffer = malloc(BUF_SIZE + 1);

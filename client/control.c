@@ -1259,7 +1259,21 @@ void request_unit_select_same_type_tile(struct unit_list *punits)
 void request_diplomat_action(enum diplomat_actions action, int dipl_id,
 			     int target_id, int value)
 {
-  dsend_packet_unit_diplomat_action(&client.conn, dipl_id,action,target_id,value);
+  dsend_packet_unit_diplomat_action(&client.conn, dipl_id,target_id,value,action);
+}
+
+/**************************************************************************
+  Query a diplomat about costs and infrastructure.
+  - action : The action to be requested.
+  - dipl_id : The unit ID of the diplomatic unit.
+  - target_id : The ID of the target unit or city.
+  - value : For DIPLOMAT_STEAL or DIPLOMAT_SABOTAGE, the technology
+            or building to aim for (spies only).
+**************************************************************************/
+void request_diplomat_answer(enum diplomat_actions action, int dipl_id,
+			     int target_id, int value)
+{
+  dsend_packet_unit_diplomat_query(&client.conn, dipl_id,target_id,value,action);
 }
 
 /**************************************************************************
@@ -1679,6 +1693,19 @@ void request_toggle_city_productions(void)
   }
 
   draw_city_productions ^= 1;
+  update_map_canvas_visible();
+}
+
+/**************************************************************************
+ Toggle display of city traderoutes
+**************************************************************************/
+void request_toggle_city_traderoutes(void)
+{
+  if (!can_client_change_view()) {
+    return;
+  }
+
+  draw_city_traderoutes ^= 1;
   update_map_canvas_visible();
 }
 
@@ -2757,6 +2784,15 @@ void key_city_growth_toggle(void)
 void key_city_productions_toggle(void)
 {
   request_toggle_city_productions();
+}
+
+/**************************************************************************
+  Handle client request to toggle drawing of traderoute information
+  by the city name for cities visible on the main map view.
+**************************************************************************/
+void key_city_traderoutes_toggle(void)
+{
+  request_toggle_city_traderoutes();
 }
 
 /**************************************************************************

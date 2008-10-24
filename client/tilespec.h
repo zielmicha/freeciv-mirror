@@ -79,10 +79,10 @@ enum mapview_layer {
   LAYER_GRID1,
   LAYER_CITY1,
   LAYER_SPECIAL2,
-  LAYER_FOG,
-  LAYER_CITY2,
   LAYER_UNIT,
   LAYER_SPECIAL3,
+  LAYER_FOG,
+  LAYER_CITY2,
   LAYER_GRID2,
   LAYER_OVERLAYS,
   LAYER_CITYBAR,
@@ -215,6 +215,7 @@ struct citybar_sprites {
   struct sprite
     *shields,
     *food,
+    *trade,
     *occupied,
     *background;
   struct sprite_vector occupancy;

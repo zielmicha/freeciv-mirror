@@ -240,7 +240,7 @@ static void insert_requirement(char *buf, size_t bufsz,
 }
 
 /****************************************************************************
-  Append text for what this requirement source allows.  Something like
+  Generate text for what this requirement source allows.  Something like
 
     "Allows Communism government (with University technology).\n\n"
     "Allows Mfg. Plant building (with Factory building).\n\n"
@@ -248,6 +248,10 @@ static void insert_requirement(char *buf, size_t bufsz,
   This should be called to generate helptext for every possible source
   type.  Note this doesn't handle effects but rather production
   requirements (currently only building reqs).
+
+  NB: This function overwrites any existing buffer contents by writing the
+  generated text to the start of the given 'buf' pointer (i.e. it does
+  NOT append like cat_snprintf).
 ****************************************************************************/
 static void insert_allows(struct universal *psource,
 			  char *buf, size_t bufsz)
@@ -1314,7 +1318,7 @@ void helptext_government(char *buf, size_t bufsz, struct player *pplayer,
 
   /* Effects */
   CATLSTR(buf, bufsz, _("Features:\n"));
-  insert_allows(&source, buf, bufsz);
+  insert_allows(&source, buf + strlen(buf), bufsz - strlen(buf));
   effect_list_iterate(get_req_source_effects(&source), peffect) {
     Output_type_id output_type = O_LAST;
     struct unit_class *unitclass = NULL;
@@ -1340,8 +1344,8 @@ void helptext_government(char *buf, size_t bufsz, struct player *pplayer,
 
            output_type = preq->source.value.outputtype;
            oname = get_output_name(output_type);
-           astr_add(&outputs_or, oname);
-           astr_add(&outputs_and, oname);
+           astr_add(&outputs_or, "%s", oname);
+           astr_add(&outputs_and, "%s", oname);
          }
          break;
        case VUT_UCLASS:
@@ -1395,32 +1399,32 @@ void helptext_government(char *buf, size_t bufsz, struct player *pplayer,
 
           if (!harvested_only || pot->harvested) {
             if (prev2 != NULL) {
-              astr_add(&outputs_or,  prev2);
-              astr_add(&outputs_or,  Q_("?or:, "));
-              astr_add(&outputs_and, prev2);
-              astr_add(&outputs_and, Q_("?and:, "));
+              astr_add(&outputs_or,  "%s", prev2);
+              astr_add(&outputs_or,  "%s", Q_("?or:, "));
+              astr_add(&outputs_and, "%s", prev2);
+              astr_add(&outputs_and, "%s", Q_("?and:, "));
             }
             prev2 = prev;
             prev = _(pot->name);
           }
         } output_type_iterate_end;
         if (prev2 != NULL) {
-          astr_add(&outputs_or, prev2);
+          astr_add(&outputs_or, "%s", prev2);
           /* TRANS: List of possible output types has this between
            *        last two elements */
-          astr_add(&outputs_or,  Q_(" or "));
-          astr_add(&outputs_and, prev2);
+          astr_add(&outputs_or,  "%s", Q_(" or "));
+          astr_add(&outputs_and, "%s", prev2);
           /* TRANS: List of possible output types has this between
            *        last two elements */
-          astr_add(&outputs_and, Q_(" and "));
+          astr_add(&outputs_and, "%s", Q_(" and "));
         }
         if (prev != NULL) {
-          astr_add(&outputs_or, prev);
-          astr_add(&outputs_and, prev);
+          astr_add(&outputs_or,  "%s", prev);
+          astr_add(&outputs_and, "%s", prev);
         } else {
           /* TRANS: Empty output type list, should never happen. */
-          astr_add(&outputs_or,  Q_("?outputlist: Nothing "));
-          astr_add(&outputs_and, Q_("?outputlist: Nothing "));
+          astr_add(&outputs_or,  "%s", Q_("?outputlist: Nothing "));
+          astr_add(&outputs_and, "%s", Q_("?outputlist: Nothing "));
         }
       }
 

@@ -47,32 +47,13 @@ const char *sset_level_names[] = {N_("None"),
 				  N_("Changed")};
 const int OLEVELS_NUM = ARRAY_SIZE(sset_level_names);
 
-
-/**************************************************************************
-  A callback invoked when autotoggle is set.
-**************************************************************************/
-static bool autotoggle_callback(bool value, const char **reject_message)
-{
-  reject_message = NULL;
-  if (!value) {
-    return TRUE;
-  }
-
-  players_iterate(pplayer) {
-    if (!pplayer->ai.control && !pplayer->is_connected) {
-      toggle_ai_player_direct(NULL, pplayer);
-      send_player_info_c(pplayer, game.est_connections);
-    }
-  } players_iterate_end;
-
-  return TRUE;
-}
-
 /*************************************************************************
   Verify that a given allowtake string is valid.  See
   game.allow_take.
 *************************************************************************/
-static bool allowtake_callback(const char *value, const char **error_string)
+static bool allowtake_callback(const char *value,
+                               struct connection *caller,
+                               const char **error_string)
 {
   int len = strlen(value), i;
   bool havecharacter_state = FALSE;
@@ -114,7 +95,9 @@ static bool allowtake_callback(const char *value, const char **error_string)
   Verify that a given startunits string is valid.  See
   game.info.start_units.
 *************************************************************************/
-static bool startunits_callback(const char *value, const char **error_string)
+static bool startunits_callback(const char *value,
+                                struct connection *caller,
+                                const char **error_string)
 {
   int len = strlen(value), i;
   bool have_founder = FALSE;
@@ -153,7 +136,8 @@ static bool startunits_callback(const char *value, const char **error_string)
 /*************************************************************************
   Verify that a given endyear is valid.
 *************************************************************************/
-static bool endyear_callback(int value, const char **error_string)
+static bool endyear_callback(int value, struct connection *caller,
+                             const char **error_string)
 {
   if (value < game.info.year) {
     /* Tried to set endyear earlier than current year */
@@ -166,7 +150,8 @@ static bool endyear_callback(int value, const char **error_string)
 /*************************************************************************
   Verify that a given maxplayers string is valid.
 *************************************************************************/
-static bool maxplayers_callback(int value, const char **error_string)
+static bool maxplayers_callback(int value, struct connection *caller,
+                                const char **error_string)
 {
 #ifdef GGZ_SERVER
   if (with_ggz) {
@@ -183,17 +168,23 @@ static bool maxplayers_callback(int value, const char **error_string)
     return FALSE;
   }
 
-  error_string = NULL;
+  *error_string = NULL;
   return TRUE;
 }
 
 /*************************************************************************
-  Create/remove players when aifill is set.
+  Disallow low timeout values for non-hack connections.
 *************************************************************************/
-static bool aifill_callback(int value, const char **error_string)
+static bool timeout_callback(int value, struct connection *caller,
+                             const char **error_string)
 {
-  aifill(value);
-  error_string = NULL;
+  if (caller && caller->access_level < ALLOW_HACK && value < 30) {
+    *error_string = _("You are not allowed to set timeout values less "
+                      "than 30 seconds.");
+    return FALSE;
+  }
+
+  *error_string = NULL;
   return TRUE;
 }
 
@@ -202,7 +193,8 @@ static bool aifill_callback(int value, const char **error_string)
   phases. NB: Assumes that it is not possible to first set team
   alternating phase mode then make teamless players.
 *************************************************************************/
-static bool phasemode_callback(int value, const char **error_string)
+static bool phasemode_callback(int value, struct connection *caller,
+                               const char **error_string)
 {
   if (value == PMT_TEAMS_ALTERNATE) {
     players_iterate(pplayer) {
@@ -478,7 +470,7 @@ struct settings_s settings[] = {
 	     "automatically created or removed to keep the total "
 	     "number of players at this amount.  As more players join, "
 	     "these AI players will be replaced.  When set to zero, "
-	     "all AI players will be removed."), aifill_callback,
+	     "all AI players will be removed."), NULL,
 	  GAME_MIN_AIFILL, GAME_MAX_AIFILL, GAME_DEFAULT_AIFILL)
 
   /* Game initialization parameters (only affect the first start of the game,
@@ -897,7 +889,7 @@ struct settings_s settings[] = {
 	   N_("Whether AI-status toggles with connection"),
 	   N_("If this is set to 1, AI status is turned off when a player "
 	      "connects, and on when a player disconnects."),
-	   autotoggle_callback, GAME_DEFAULT_AUTO_AI_TOGGLE)
+	   NULL, GAME_DEFAULT_AUTO_AI_TOGGLE)
 
   GEN_INT("endyear", game.info.end_year,
 	  SSET_META, SSET_SOCIOLOGY, SSET_VITAL, SSET_TO_CLIENT,
@@ -912,10 +904,12 @@ struct settings_s settings[] = {
 	  N_("If all players have not hit \"Turn Done\" before this "
 	     "time is up, then the turn ends automatically. Zero "
 	     "means there is no timeout. In servers compiled with "
-	     "debugging, a timeout "
-	     "of -1 sets the autogame test mode. Use this with the command "
-	     "\"timeoutincrease\" to have a dynamic timer."), NULL, 
-	   GAME_MIN_TIMEOUT, GAME_MAX_TIMEOUT, GAME_DEFAULT_TIMEOUT)
+             "debugging, a timeout of -1 sets the autogame test mode. "
+             "Only connections with hack level access may set the "
+             "timeout to lower than 30 seconds. Use this with the "
+             "command \"timeoutincrease\" to have a dynamic timer."),
+          timeout_callback,
+          GAME_MIN_TIMEOUT, GAME_MAX_TIMEOUT, GAME_DEFAULT_TIMEOUT)
 
   GEN_INT("timeaddenemymove", game.timeoutaddenemymove,
 	  SSET_META, SSET_INTERNAL, SSET_VITAL, SSET_TO_CLIENT,

@@ -16,6 +16,7 @@
 #endif
 
 #include <assert.h>
+#include <limits.h> /* USHRT_MAX */
 
 #include "events.h"
 #include "fcintl.h"
@@ -709,6 +710,33 @@ void handle_edit_city(struct connection *pc,
     }
   } improvement_iterate_end;
  
+  /* Handle food stock change. */
+  if (packet->food_stock != pcity->food_stock) {
+    int max = city_granary_size(pcity->size);
+    if (!(0 <= packet->food_stock && packet->food_stock <= max)) {
+      notify_conn(pc->self, ptile, E_BAD_COMMAND,
+                  _("Invalid city food stock amount %d for city %s "
+                    "(allowed range is %d to %d)."),
+                  packet->food_stock, pcity->name, 0, max);
+    } else {
+      pcity->food_stock = packet->food_stock;
+      changed = TRUE;
+    }
+  }
+
+  /* Handle shield stock change. */
+  if (packet->shield_stock != pcity->shield_stock) {
+    int max = USHRT_MAX; /* Limited to uint16 by city info packet. */
+    if (!(0 <= packet->shield_stock && packet->shield_stock <= max)) {
+      notify_conn(pc->self, ptile, E_BAD_COMMAND,
+                  _("Invalid city shield stock amount %d for city %s "
+                    "(allowed range is %d to %d)."),
+                  packet->shield_stock, pcity->name, 0, max);
+    } else {
+      pcity->shield_stock = packet->shield_stock;
+      changed = TRUE;
+    }
+  }
 
   /* TODO: Handle more property edits. */
 
@@ -795,6 +823,15 @@ void handle_edit_player(struct connection *pc,
                     "because the given nation ID %d is invalid."),
                   player_number(pplayer), player_name(pplayer),
                   packet->nation);
+    } else if (pnation->player != NULL) {
+      notify_conn(pc->self, NULL, E_BAD_COMMAND,
+                  _("Cannot change nation for player %d (%s) "
+                    "to nation %d (%s) because that nation is "
+                    "already assigned to player %d (%s)."),
+                  player_number(pplayer), player_name(pplayer),
+                  packet->nation, nation_plural_translation(pnation),
+                  player_number(pnation->player),
+                  player_name(pnation->player));
     } else {
       changed = player_set_nation(pplayer, pnation);
     }
@@ -1109,5 +1146,40 @@ void handle_edit_startpos(struct connection *pc, int x, int y,
 
   if (changed) {
     send_tile_info(NULL, ptile, FALSE);
+  }
+}
+
+/****************************************************************************
+  Handle edit requests to the main game data structure.
+****************************************************************************/
+void handle_edit_game(struct connection *pc,
+                      struct packet_edit_game *packet)
+{
+  bool changed = FALSE;
+
+  if (!can_conn_edit(pc)) {
+    notify_conn(pc->self, NULL, E_BAD_COMMAND,
+                _("You are not allowed to edit."));
+    return;
+  }
+
+  if (packet->year != game.info.year) {
+
+    /* 'year' is stored in a signed short. */
+    const short min_year = -30000, max_year = 30000;
+
+    if (!(min_year <= packet->year && packet->year <= max_year)) {
+      notify_conn(pc->self, NULL, E_BAD_COMMAND,
+                  _("Cannot set invalid game year %d. Valid year range "
+                    "is from %d to %d."),
+                  packet->year, min_year, max_year);
+    } else {
+      game.info.year = packet->year;
+      changed = TRUE;
+    }
+  }
+
+  if (changed) {
+    send_game_info(NULL);
   }
 }

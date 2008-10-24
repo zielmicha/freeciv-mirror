@@ -2058,6 +2058,27 @@ static void player_load_main(struct player *plr, int plrno,
     plr->target_government = government_of_player(plr);
   }
 
+  BV_CLR_ALL(plr->embassy);
+  if (has_capability("embassies", savefile_options)) {
+    players_iterate(pother) {
+      if (secfile_lookup_bool(file, "player%d.embassy%d",
+			      plrno, player_number(pother))) {
+	BV_SET(plr->embassy, player_index(pother));
+      }
+    } players_iterate_end;
+  } else {
+    /* Required for 2.0 and earlier savegames.  Remove eventually and make
+     * the cap check mandatory. */
+    int embassy = secfile_lookup_int(file, "player%d.embassy", plrno);
+
+    players_iterate(pother) {
+      if (embassy & (1 << player_index(pother))) {
+	BV_SET(plr->embassy, player_index(pother));
+      }
+    } players_iterate_end;
+
+  }
+
   p = secfile_lookup_str_default(file, NULL, "player%d.city_style_by_name",
                                  plrno);
   if (!p) {
@@ -2257,6 +2278,9 @@ static void player_load_main(struct player *plr, int plrno,
       secfile_lookup_int_default(file, 0,
 				 "player%d.diplstate%d.has_reason_to_cancel",
 				 plrno, i);
+    plr->diplstates[i].contact_turns_left = 
+      secfile_lookup_int_default(file, 0,
+			   "player%d.diplstate%d.contact_turns_left", plrno, i);
   }
   /* We don't need this info, but savegames carry it anyway.
      To avoid getting "unused" warnings we touch the values like this. */
@@ -2268,6 +2292,8 @@ static void player_load_main(struct player *plr, int plrno,
     secfile_lookup_int_default(file, 0,
 			       "player%d.diplstate%d.has_reason_to_cancel",
 			       plrno, i);
+    secfile_lookup_int_default(file, 0,
+			   "player%d.diplstate%d.contact_turns_left", plrno, i);
   }
 
   { /* spacerace */
@@ -2360,7 +2386,7 @@ static void player_load_cities(struct player *plr, int plrno,
     /* lookup name out of order */
     my_snprintf(named, sizeof(named), "player%d.c%d.name", plrno, i);
     /* instead of dying, use name string for damaged name */
-    name = secfile_lookup_str_default(file, named, named);
+    name = secfile_lookup_str_default(file, named, "%s", named);
     /* copied into city->name */
     pcity = create_city_virtual(plr, pcenter, name);
 
@@ -2992,9 +3018,9 @@ static void player_load_vision(struct player *plr, int plrno,
       zeroline[i]= '\0';
 
       bases_halfbyte_iterate(j) {
-        char buf[16]; /* enough for sprintf() below */
+        char buf[32]; /* should be enough for snprintf() below */
 
-        sprintf(buf, "player%d.map_b%02d_%%03d", plrno, j);
+        my_snprintf(buf, sizeof(buf), "player%d.map_b%02d_%%03d", plrno, j);
 
         LOAD_MAP_DATA(ch, nat_y, ptile,
                       secfile_lookup_str_default(file, zeroline, buf, nat_y),
@@ -3028,6 +3054,7 @@ static void player_load_vision(struct player *plr, int plrno,
 		  ascii_hex2bin(ch, 3));
 
     for (i = 0; i < total_ncities; i++) {
+      /* similar to create_vision_site() */
       struct vision_site *pdcity = create_vision_site(0, NULL, NULL);
 
       nat_y = secfile_lookup_int(file, "player%d.dc%d.y", plrno, i);
@@ -3166,6 +3193,11 @@ static void player_save_main(struct player *plr, int plrno,
 		       "player%d.target_government_name", plrno);
   }
 
+  players_iterate(pother) {
+    secfile_insert_bool(file, BV_ISSET(plr->embassy, player_index(pother)),
+			"player%d.embassy%d", plrno, player_number(pother));
+  } players_iterate_end;
+
   /* Required for 2.0 and earlier servers.  Remove eventually. */
   secfile_insert_int(file, 0, "player%d.embassy", plrno);
 
@@ -3278,6 +3310,8 @@ static void player_save_main(struct player *plr, int plrno,
 		       "player%d.diplstate%d.turns_left", plrno, i);
     secfile_insert_int(file, plr->diplstates[i].has_reason_to_cancel,
 		       "player%d.diplstate%d.has_reason_to_cancel", plrno, i);
+    secfile_insert_int(file, plr->diplstates[i].contact_turns_left,
+		       "player%d.diplstate%d.contact_turns_left", plrno, i);
   }
 
   {
@@ -4457,10 +4491,8 @@ static void game_load_internal(struct section_file *file)
     rstate.j = secfile_lookup_int(file,"random.index_J");
     rstate.k = secfile_lookup_int(file,"random.index_K");
     rstate.x = secfile_lookup_int(file,"random.index_X");
-    for(i=0;i<8;i++) {
-      char name[20];
-      my_snprintf(name, sizeof(name), "random.table%d",i);
-      string=secfile_lookup_str(file,name);
+    for(i = 0; i < 8; i++) {
+      string = secfile_lookup_str(file, "random.table%d",i);
       sscanf(string,"%8x %8x %8x %8x %8x %8x %8x", &rstate.v[7*i],
 	     &rstate.v[7*i+1], &rstate.v[7*i+2], &rstate.v[7*i+3],
 	     &rstate.v[7*i+4], &rstate.v[7*i+5], &rstate.v[7*i+6]);
@@ -4940,15 +4972,14 @@ void game_save(struct section_file *file, const char *save_reason)
     secfile_insert_int(file, rstate.x, "random.index_X");
 
     for (i = 0; i < 8; i++) {
-      char name[20], vec[100];
+      char vec[100];
 
-      my_snprintf(name, sizeof(name), "random.table%d", i);
       my_snprintf(vec, sizeof(vec),
 		  "%8x %8x %8x %8x %8x %8x %8x", rstate.v[7 * i],
 		  rstate.v[7 * i + 1], rstate.v[7 * i + 2],
 		  rstate.v[7 * i + 3], rstate.v[7 * i + 4],
 		  rstate.v[7 * i + 5], rstate.v[7 * i + 6]);
-      secfile_insert_str(file, vec, name);
+      secfile_insert_str(file, vec, "random.table%d", i);
     }
   } else {
     secfile_insert_int(file, 0, "game.save_random");

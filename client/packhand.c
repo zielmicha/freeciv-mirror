@@ -536,8 +536,17 @@ void handle_city_info(struct packet_city_info *packet)
             TILE_XY(packet));
     return;
   } else {
+    bool traderoutes_changed = FALSE;
     name_changed = (0 != strncmp(packet->name, pcity->name,
                                  sizeof(pcity->name)));
+
+    if (draw_city_traderoutes
+        && (0 != memcmp(pcity->trade, packet->trade,
+                        sizeof(pcity->trade))
+            || 0 != memcmp(pcity->trade_value, packet->trade_value,
+                           sizeof(pcity->trade_value)))) {
+      traderoutes_changed = TRUE;
+    }
 
     /* Descriptions should probably be updated if the
      * city name, production or time-to-grow changes.
@@ -551,7 +560,8 @@ void handle_city_info(struct packet_city_info *packet)
               || pcity->shield_stock != packet->shield_stock))
       || (draw_city_growth
           && (pcity->food_stock != packet->food_stock
-              || pcity->surplus[O_FOOD] != packet->surplus[O_FOOD]));
+              || pcity->surplus[O_FOOD] != packet->surplus[O_FOOD]))
+      || (draw_city_traderoutes && traderoutes_changed);
   }
   
   sz_strlcpy(pcity->name, packet->name);
@@ -1402,7 +1412,6 @@ static bool handle_unit_packet_common(struct unit *packet_unit)
 
     punit->veteran = packet_unit->veteran;
     punit->moves_left = packet_unit->moves_left;
-    punit->bribe_cost = 0;
     punit->fuel = packet_unit->fuel;
     punit->goto_tile = packet_unit->goto_tile;
     punit->paradropped = packet_unit->paradropped;
@@ -1614,6 +1623,12 @@ void handle_game_info(struct packet_game_info *pinfo)
   if (update_aifill_button) {
     update_start_page();
   }
+  
+  if (can_client_change_view()) {
+    update_info_label();
+  }
+
+  editgui_notify_object_changed(OBJTYPE_GAME, 1, FALSE);
 }
 
 /**************************************************************************
@@ -1704,6 +1719,12 @@ void handle_player_info(struct packet_player_info *pinfo)
   pplayer->economic.luxury=pinfo->luxury;
   pplayer->government = government_by_number(pinfo->government);
   pplayer->target_government = government_by_number(pinfo->target_government);
+  BV_CLR_ALL(pplayer->embassy);
+  players_iterate(pother) {
+    if (pinfo->embassy[player_index(pother)]) {
+      BV_SET(pplayer->embassy, player_index(pother));
+    }
+  } players_iterate_end;
   pplayer->gives_shared_vision = pinfo->gives_shared_vision;
   pplayer->city_style=pinfo->city_style;
   for (i = 0; i < MAX_NUM_PLAYERS + MAX_NUM_BARBARIANS; i++) {
@@ -1734,6 +1755,8 @@ void handle_player_info(struct packet_player_info *pinfo)
       pinfo->diplstates[i].type;
     pplayer->diplstates[i].turns_left =
       pinfo->diplstates[i].turns_left;
+    pplayer->diplstates[i].contact_turns_left =
+      pinfo->diplstates[i].contact_turns_left;
     pplayer->diplstates[i].has_reason_to_cancel =
       pinfo->diplstates[i].has_reason_to_cancel;
   }
@@ -2358,9 +2381,6 @@ void handle_tile_info(struct packet_tile_info *packet)
     unit_list_unlink_all(ptile->units);
   }
 
-  /* Continent renumbering may lead to a larger value for num_continents
-   * at the client than what the server has.  This is assumed to be
-   * harmless.  See PR#39472 discussion. */
   ptile->continent = packet->continent;
   map.num_continents = MAX(ptile->continent, map.num_continents);
 
@@ -3034,36 +3054,6 @@ void handle_ruleset_specialist(struct packet_ruleset_specialist *p)
 }
 
 /**************************************************************************
-  ...
-**************************************************************************/
-void handle_unit_bribe_info(int unit_id, int cost)
-{
-  struct unit *punit = game_find_unit_by_number(unit_id);
-
-  if (punit) {
-    punit->bribe_cost = cost;
-    if (NULL != client.conn.playing && !client.conn.playing->ai.control) {
-      popup_bribe_dialog(punit);
-    }
-  }
-}
-
-/**************************************************************************
-  ...
-**************************************************************************/
-void handle_city_incite_info(int city_id, int cost)
-{
-  struct city *pcity = game_find_city_by_number(city_id);
-
-  if (pcity) {
-    pcity->incite_revolt_cost = cost;
-    if (NULL != client.conn.playing && !client.conn.playing->ai.control) {
-      popup_incite_dialog(pcity);
-    }
-  }
-}
-
-/**************************************************************************
 ...
 **************************************************************************/
 void handle_city_name_suggestion_info(int unit_id, char *name)
@@ -3086,20 +3076,47 @@ void handle_city_name_suggestion_info(int unit_id, char *name)
 /**************************************************************************
 ...
 **************************************************************************/
-void handle_unit_diplomat_popup_dialog(int diplomat_id, int target_id)
+void handle_unit_diplomat_answer(int diplomat_id, int target_id, int cost,
+				 enum diplomat_actions action_type)
 {
+  struct city *pcity = game_find_city_by_number(target_id);
+  struct unit *punit = game_find_unit_by_number(target_id);
   struct unit *pdiplomat = player_find_unit_by_id(client.conn.playing, diplomat_id);
 
   if (NULL == pdiplomat) {
     freelog(LOG_ERROR,
-	    "handle_unit_diplomat_popup_dialog() bad diplomat %d.",
+	    "handle_unit_diplomat_answer() bad diplomat %d.",
 	    diplomat_id);
     return;
   }
 
-  if (can_client_issue_orders()) {
-    process_diplomat_arrival(pdiplomat, target_id);
-  }
+  switch (action_type) {
+  case DIPLOMAT_BRIBE:
+    if (punit) {
+      if (NULL != client.conn.playing && !client.conn.playing->ai.control) {
+        popup_bribe_dialog(punit, cost);
+      }
+    }
+    break;
+  case DIPLOMAT_INCITE:
+    if (pcity) {
+      if (NULL != client.conn.playing && !client.conn.playing->ai.control) {
+        popup_incite_dialog(pcity, cost);
+      }
+    }
+    break;
+  case DIPLOMAT_MOVE:
+    if (can_client_issue_orders()) {
+      process_diplomat_arrival(pdiplomat, target_id);
+    }
+    break;
+  default:
+    freelog(LOG_ERROR,
+	    "handle_unit_diplomat_answer()"
+	    " invalid action_type (%d).",
+	    action_type);
+    break;
+  };
 }
 
 /**************************************************************************

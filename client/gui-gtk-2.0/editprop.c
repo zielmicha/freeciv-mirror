@@ -15,6 +15,8 @@
 #include <config.h>
 #endif
 
+#include <limits.h> /* USHRT_MAX */
+
 #include <gtk/gtk.h>
 #include <gdk/gdkkeysyms.h>
 
@@ -46,7 +48,9 @@ struct property_page;
 struct property_editor;
 struct extviewer;
 
-/* Helper function declarations. */
+/****************************************************************************
+  Miscellaneous helpers.
+****************************************************************************/
 static GdkPixbuf *create_pixbuf_from_layers(struct tile *ptile,
                                             struct unit *punit,
                                             struct city *pcity,
@@ -78,7 +82,33 @@ union packetdata {
   struct packet_edit_city *city;
   struct packet_edit_unit *unit;
   struct packet_edit_player *player;
+  struct packet_edit_game *game;
 };
+
+
+#define PF_MAX_CLAUSES 16
+#define PF_DISJUNCTION_SEPARATOR "|"
+#define PF_CONJUNCTION_SEPARATOR "&"
+
+struct pf_pattern {
+  bool negate;
+  char *text;
+};
+
+struct pf_conjunction {
+  struct pf_pattern conjunction[PF_MAX_CLAUSES];
+  int count;
+};
+
+struct property_filter {
+  struct pf_conjunction disjunction[PF_MAX_CLAUSES];
+  int count;
+};
+
+static struct property_filter *property_filter_new(const char *filter);
+static bool property_filter_match(struct property_filter *pf,
+                                  const struct objprop *op);
+static void property_filter_free(struct property_filter *pf);
 
 
 /****************************************************************************
@@ -247,11 +277,15 @@ enum object_property_ids {
   OPID_CITY_XY,
   OPID_CITY_SIZE,
   OPID_CITY_BUILDINGS,
+  OPID_CITY_FOOD_STOCK,
+  OPID_CITY_SHIELD_STOCK,
 
   OPID_PLAYER_NAME,
   OPID_PLAYER_NATION,
   OPID_PLAYER_ADDRESS,
-  OPID_PLAYER_INVENTIONS
+  OPID_PLAYER_INVENTIONS,
+
+  OPID_GAME_YEAR
 };
 
 enum object_property_flags {
@@ -267,6 +301,7 @@ struct objprop {
   int flags;
   int valtype;
   int column_id;
+  GtkTreeViewColumn *view_column;
   GtkWidget *widget;
   struct extviewer *extviewer;
   struct property_page *parent_page;
@@ -291,6 +326,9 @@ static GType objprop_get_gtype(const struct objprop *op);
 static const char *objprop_get_attribute_type_string(const struct objprop *op);
 static void objprop_set_column_id(struct objprop *op, int col_id);
 static int objprop_get_column_id(const struct objprop *op);
+static void objprop_set_treeview_column(struct objprop *op,
+                                        GtkTreeViewColumn *col);
+static GtkTreeViewColumn *objprop_get_treeview_column(const struct objprop *op);
 static GtkCellRenderer *objprop_create_cell_renderer(const struct objprop *op);
 
 static void objprop_setup_widget(struct objprop *op);
@@ -401,6 +439,7 @@ struct property_page {
   GtkListStore *object_store;
   GtkWidget *object_view;
   GtkWidget *extviewer_notebook;
+  GtkTooltips *tooltips;
 
   struct hash_table *objprop_table;
   struct hash_table *objbind_table;
@@ -484,6 +523,7 @@ struct property_editor {
   GtkWidget *widget;
   GtkWidget *notebook;
   GtkWidget *combo;
+  GtkTooltips *tooltips;
 
   struct property_page *property_pages[NUM_OBJTYPES];
 };
@@ -522,6 +562,10 @@ static const char *objtype_get_name(int objtype)
 
   case OBJTYPE_PLAYER:
     return _("Player");
+    break;
+
+  case OBJTYPE_GAME:
+    return Q_("?play:Game");
     break;
 
   default:
@@ -563,6 +607,10 @@ static int objtype_get_id_from_object(int objtype, gpointer object)
   case OBJTYPE_PLAYER:
     pplayer = object;
     id = player_number(pplayer);
+    break;
+
+  case OBJTYPE_GAME:
+    id = 1;
     break;
 
   default:
@@ -1040,6 +1088,9 @@ static gpointer objbind_get_object(struct objbind *ob)
   case OBJTYPE_PLAYER:
     return valid_player_by_number(id);
     break;
+  case OBJTYPE_GAME:
+    return &game;
+    break;
   default:
     break;
   }
@@ -1213,6 +1264,12 @@ static struct propval *objbind_get_value_from_object(struct objbind *ob,
     case OPID_CITY_BUILDINGS:
       pv->data.v_built = pcity->built;
       break;
+    case OPID_CITY_FOOD_STOCK:
+      pv->data.v_int = pcity->food_stock;
+      break;
+    case OPID_CITY_SHIELD_STOCK:
+      pv->data.v_int = pcity->shield_stock;
+      break;
     default:
       freelog(LOG_ERROR, "Unhandled request for value of property %d "
               "(%s) from object of type \"%s\" in "
@@ -1246,6 +1303,26 @@ static struct propval *objbind_get_value_from_object(struct objbind *ob,
             = TECH_KNOWN == player_invention_state(pplayer, tech);
       } advance_index_iterate_end;
       pv->must_free = TRUE;
+      break;
+    default:
+      freelog(LOG_ERROR, "Unhandled request for value of property %d "
+              "(%s) from object of type \"%s\" in "
+              "objbind_get_value_from_object().",
+              propid, objprop_get_name(op), objtype_get_name(objtype));
+      goto FAILED;
+      break;
+    }
+
+  } else if (objtype == OBJTYPE_GAME) {
+    struct civ_game *pgame = objbind_get_object(ob);
+
+    if (pgame == NULL) {
+      goto FAILED;
+    }
+
+    switch (propid) {
+    case OPID_GAME_YEAR:
+      pv->data.v_int = pgame->info.year;
       break;
     default:
       freelog(LOG_ERROR, "Unhandled request for value of property %d "
@@ -1318,6 +1395,11 @@ static bool objbind_get_allowed_value_span(struct objbind *ob,
     }
 
   } else if (objtype == OBJTYPE_CITY) {
+    struct city *pcity = objbind_get_object(ob);
+
+    if (!pcity) {
+      return FALSE;
+    }
 
     switch (propid) {
     case OPID_CITY_SIZE:
@@ -1325,6 +1407,18 @@ static bool objbind_get_allowed_value_span(struct objbind *ob,
       max = MAX_CITY_SIZE;
       step = 1;
       big_step = 5;
+      break;
+    case OPID_CITY_FOOD_STOCK:
+      min = 0;
+      max = city_granary_size(pcity->size);
+      step = 1;
+      big_step = 5;
+      break;
+    case OPID_CITY_SHIELD_STOCK:
+      min = 0;
+      max = USHRT_MAX; /* Limited to uint16 by city info packet. */
+      step = 1;
+      big_step = 10;
       break;
     default:
       freelog(LOG_ERROR, "Unhandled request for value range of "
@@ -1346,6 +1440,25 @@ static bool objbind_get_allowed_value_span(struct objbind *ob,
       ok = FALSE;
       break;
     }
+
+  } else if (objtype == OBJTYPE_GAME) {
+
+    switch (propid) {
+    case OPID_GAME_YEAR:
+      min = -30000;
+      max = 30000;
+      step = 1;
+      big_step = 25;
+      break;
+    default:
+      freelog(LOG_ERROR, "Unhandled request for value range of "
+              "property %d (%s) from object of type \"%s\" in "
+              "objbind_get_allowed_value_span().",
+              propid, objprop_get_name(op), objtype_get_name(objtype));
+      ok = FALSE;
+      break;
+    }
+
   } else {
     ok = FALSE;
   }
@@ -1599,6 +1712,8 @@ static void objbind_pack_current_values(struct objbind *ob,
     for (i = 0; i < B_LAST; i++) {
       packet->built[i] = pcity->built[i].turn;
     }
+    packet->food_stock = pcity->food_stock;
+    packet->shield_stock = pcity->shield_stock;
     /* TODO: Set more packet fields. */
 
   } else if (objtype == OBJTYPE_PLAYER) {
@@ -1620,6 +1735,16 @@ static void objbind_pack_current_values(struct objbind *ob,
     } advance_index_iterate_end;
     /* TODO: Set more packet fields. */
 
+  } else if (objtype == OBJTYPE_GAME) {
+    struct packet_edit_game *packet = pd.game;
+    struct civ_game *pgame = objbind_get_object(ob);
+
+    if (!pgame) {
+      return;
+    }
+
+    packet->year = pgame->info.year;
+    /* TODO: Set more packet fields. */
   }
 }
 
@@ -1705,6 +1830,12 @@ static void objbind_pack_modified_value(struct objbind *ob,
     case OPID_CITY_SIZE:
       packet->size = pv->data.v_int;
       break;
+    case OPID_CITY_FOOD_STOCK:
+      packet->food_stock = pv->data.v_int;
+      break;
+    case OPID_CITY_SHIELD_STOCK:
+      packet->shield_stock = pv->data.v_int;
+      break;
     case OPID_CITY_BUILDINGS:
       for (i = 0; i < B_LAST; i++) {
         packet->built[i] = pv->data.v_built[i].turn;
@@ -1736,6 +1867,21 @@ static void objbind_pack_modified_value(struct objbind *ob,
       advance_index_iterate(A_FIRST, tech) {
         packet->inventions[tech] = pv->data.v_inventions[tech];
       } advance_index_iterate_end;
+      break;
+    default:
+      freelog(LOG_ERROR, "Unhandled request to pack value of "
+              "property %d (%s) from object of type \"%s\" in "
+              "objbind_pack_modified_value().",
+              propid, objprop_get_name(op), objtype_get_name(objtype));
+      break;
+    }
+
+  } else if (objtype == OBJTYPE_GAME) {
+    struct packet_edit_game *packet = pd.game;
+
+    switch (propid) {
+    case OPID_GAME_YEAR:
+      packet->year = pv->data.v_int;
       break;
     default:
       freelog(LOG_ERROR, "Unhandled request to pack value of "
@@ -1874,6 +2020,7 @@ static const char *objprop_get_attribute_type_string(const struct objprop *op)
   Store the column id of the list store that this object property can be
   viewed in. This should generally only be changed set once, when the
   object property's associated list view is created.
+  NB: This is the column id in the model, not the view.
 ****************************************************************************/
 static void objprop_set_column_id(struct objprop *op, int col_id)
 {
@@ -1886,6 +2033,7 @@ static void objprop_set_column_id(struct objprop *op, int col_id)
 /****************************************************************************
   Returns the column id in the list store for this object property.
   May return -1 if not applicable or if not yet set.
+  NB: This is the column id in the model, not the view.
 ****************************************************************************/
 static int objprop_get_column_id(const struct objprop *op)
 {
@@ -1893,6 +2041,30 @@ static int objprop_get_column_id(const struct objprop *op)
     return -1;
   }
   return op->column_id;
+}
+
+/****************************************************************************
+  Sets the view column reference for later convenience.
+****************************************************************************/
+static void objprop_set_treeview_column(struct objprop *op,
+                                        GtkTreeViewColumn *col)
+{
+  if (!op) {
+    return;
+  }
+  op->view_column = col;
+}
+
+/****************************************************************************
+  Returns the previously stored tree view column reference, or NULL if none
+  exists.
+****************************************************************************/
+static GtkTreeViewColumn *objprop_get_treeview_column(const struct objprop *op)
+{
+  if (!op) {
+    return NULL;
+  }
+  return op->view_column;
 }
 
 /****************************************************************************
@@ -2062,6 +2234,8 @@ static void objprop_setup_widget(struct objprop *op)
     break;
 
   case OPID_CITY_SIZE:
+  case OPID_CITY_SHIELD_STOCK:
+  case OPID_GAME_YEAR:
     spin = gtk_spin_button_new_with_range(0.0, 100.0, 1.0);
     g_signal_connect(spin, "value-changed",
                      G_CALLBACK(objprop_widget_spin_button_changed), op);
@@ -2070,6 +2244,7 @@ static void objprop_setup_widget(struct objprop *op)
     break;
 
   case OPID_UNIT_MOVES_LEFT:
+  case OPID_CITY_FOOD_STOCK:
     hbox2 = gtk_hbox_new(FALSE, 4);
     gtk_box_pack_start(GTK_BOX(hbox), hbox2, TRUE, TRUE, 0);
     spin = gtk_spin_button_new_with_range(0.0, 100.0, 1.0);
@@ -2224,6 +2399,8 @@ static void objprop_refresh_widget(struct objprop *op,
     break;
 
   case OPID_CITY_SIZE:
+  case OPID_CITY_SHIELD_STOCK:
+  case OPID_GAME_YEAR:
     spin = objprop_get_child_widget(op, "spin");
     if (pv) {
       disable_widget_callback(spin,
@@ -2242,6 +2419,7 @@ static void objprop_refresh_widget(struct objprop *op,
     break;
 
   case OPID_UNIT_MOVES_LEFT:
+  case OPID_CITY_FOOD_STOCK:
     spin = objprop_get_child_widget(op, "spin");
     label = objprop_get_child_widget(op, "max-value-label");
     if (pv) {
@@ -2973,11 +3151,11 @@ static void property_page_setup_objprops(struct property_page *pp)
             OPF_IN_LISTVIEW | OPF_HAS_WIDGET, VALTYPE_INT);
     /* TRANS: The coordinate X in native coordinates.
      * The freeciv coordinate system is described in doc/HACKING. */
-    ADDPROP(OPID_TILE_NAT_X, _("NAT_X"),
+    ADDPROP(OPID_TILE_NAT_X, _("NAT X"),
             OPF_IN_LISTVIEW | OPF_HAS_WIDGET, VALTYPE_INT);
     /* TRANS: The coordinate Y in native coordinates.
      * The freeciv coordinate system is described in doc/HACKING. */
-    ADDPROP(OPID_TILE_NAT_Y, _("NAT_Y"),
+    ADDPROP(OPID_TILE_NAT_Y, _("NAT Y"),
             OPF_IN_LISTVIEW | OPF_HAS_WIDGET, VALTYPE_INT);
     ADDPROP(OPID_TILE_CONTINENT, _("Continent"),
             OPF_IN_LISTVIEW | OPF_HAS_WIDGET, VALTYPE_INT);
@@ -3017,6 +3195,10 @@ static void property_page_setup_objprops(struct property_page *pp)
             OPF_IN_LISTVIEW | OPF_HAS_WIDGET | OPF_EDITABLE, VALTYPE_INT);
     ADDPROP(OPID_CITY_BUILDINGS, _("Buildings"), OPF_IN_LISTVIEW
             | OPF_HAS_WIDGET | OPF_EDITABLE, VALTYPE_BUILT_ARRAY);
+    ADDPROP(OPID_CITY_FOOD_STOCK, _("Food Stock"),
+            OPF_IN_LISTVIEW | OPF_HAS_WIDGET | OPF_EDITABLE, VALTYPE_INT);
+    ADDPROP(OPID_CITY_SHIELD_STOCK, _("Shield Stock"),
+            OPF_IN_LISTVIEW | OPF_HAS_WIDGET | OPF_EDITABLE, VALTYPE_INT);
     break;
 
   case OBJTYPE_PLAYER:
@@ -3028,6 +3210,11 @@ static void property_page_setup_objprops(struct property_page *pp)
             | OPF_HAS_WIDGET | OPF_EDITABLE, VALTYPE_NATION);
     ADDPROP(OPID_PLAYER_INVENTIONS, _("Inventions"), OPF_IN_LISTVIEW
             | OPF_HAS_WIDGET | OPF_EDITABLE, VALTYPE_INVENTIONS_ARRAY);
+    break;
+
+  case OBJTYPE_GAME:
+    ADDPROP(OPID_GAME_YEAR, _("Year"), OPF_IN_LISTVIEW
+            | OPF_HAS_WIDGET | OPF_EDITABLE, VALTYPE_INT);
     break;
 
   default:
@@ -3125,27 +3312,37 @@ static void property_page_quick_find_entry_changed(GtkWidget *entry,
                                                    gpointer userdata)
 {
   struct property_page *pp;
-  const gchar *text, *name;
+  const gchar *text;
   GtkWidget *w;
+  GtkTreeViewColumn *col;
+  struct property_filter *pf;
+  bool matched;
 
   pp = userdata;
   text = gtk_entry_get_text(GTK_ENTRY(entry));
+  pf = property_filter_new(text);
 
   property_page_objprop_iterate(pp, op) {
-    if (!objprop_has_widget(op)) {
+    if (!objprop_has_widget(op)
+        && !objprop_show_in_listview(op)) {
       continue;
     }
+    matched = property_filter_match(pf, op);
     w = objprop_get_widget(op);
-    if (!w) {
-      continue;
+    if (objprop_has_widget(op) && w != NULL) {
+      if (matched) {
+        gtk_widget_show(w);
+      } else {
+        gtk_widget_hide(w);
+      }
     }
-    name = objprop_get_name(op);
-    if (text[0] == '\0' || mystrcasestr(name, text)) {
-      gtk_widget_show(w);
-    } else {
-      gtk_widget_hide(w);
+    col = objprop_get_treeview_column(op);
+    if (objprop_show_in_listview(op) && col != NULL) {
+      gtk_tree_view_column_set_visible(col, matched);
     }
   } property_page_objprop_iterate_end;
+
+  property_filter_free(pf);
 }
 
 /****************************************************************************
@@ -3172,6 +3369,7 @@ static struct property_page *property_page_new(int objtype)
 
   pp = fc_calloc(1, sizeof(struct property_page));
   pp->objtype = objtype;
+  pp->tooltips = gtk_tooltips_new();
 
   pp->objprop_table = hash_new(hash_fval_int,
                                hash_fcmp_int);
@@ -3257,6 +3455,7 @@ static struct property_page *property_page_new(int objtype)
       gtk_tree_view_column_set_clickable(col, FALSE);
     }
     gtk_tree_view_append_column(GTK_TREE_VIEW(view), col);
+    objprop_set_treeview_column(op, col);
 
   } property_page_objprop_iterate_end;
 
@@ -3289,8 +3488,10 @@ static struct property_page *property_page_new(int objtype)
   gtk_box_pack_start(GTK_BOX(hbox), notebook, TRUE, TRUE, 0);
   pp->extviewer_notebook = notebook;
 
+  /* Now create the properties panel. */
   frame = gtk_frame_new(_("Properties"));
   gtk_container_set_border_width(GTK_CONTAINER(frame), 4);
+  gtk_widget_set_size_request(frame, 256, -1);
   gtk_box_pack_start(GTK_BOX(vbox), frame, TRUE, TRUE, 0);
 
   scrollwin = gtk_scrolled_window_new(NULL, NULL);
@@ -3326,10 +3527,16 @@ static struct property_page *property_page_new(int objtype)
   gtk_container_set_border_width(GTK_CONTAINER(hbox2), 4);
   gtk_box_pack_start(GTK_BOX(vbox), hbox2, FALSE, FALSE, 4);
 
-  label = gtk_label_new(_("Quick Find:"));
+  label = gtk_label_new(_("Filter:"));
   gtk_box_pack_start(GTK_BOX(hbox2), label, FALSE, FALSE, 0);
 
   entry = gtk_entry_new();
+  gtk_tooltips_set_tip(pp->tooltips, entry, 
+      _("Enter a filter string to limit which properties are shown. "
+        "The filter is one or more text patterns separated by | "
+        "(\"or\") or & (\"and\"). The symbol & has higher precedence "
+        "than |. A pattern may also be negated by prefixing it with !."),
+      "");
   g_signal_connect(entry, "changed",
       G_CALLBACK(property_page_quick_find_entry_changed), pp);
   gtk_box_pack_start(GTK_BOX(hbox2), entry, TRUE, TRUE, 0);
@@ -3842,6 +4049,9 @@ static union packetdata property_page_new_packet(struct property_page *pp)
   case OBJTYPE_PLAYER:
     packet.player = fc_calloc(1, sizeof(*packet.player));
     break;
+  case OBJTYPE_GAME:
+    packet.game = fc_calloc(1, sizeof(*packet.game));
+    break;
   default:
     break;
   }
@@ -3871,6 +4081,9 @@ static void property_page_send_packet(struct property_page *pp,
     break;
   case OBJTYPE_PLAYER:
     send_packet_edit_player(&client.conn, packet.player);
+    break;
+  case OBJTYPE_GAME:
+    send_packet_edit_game(&client.conn, packet.game);
     break;
   default:
     break;
@@ -4149,20 +4362,46 @@ static void property_editor_combo_changed(GtkComboBox *combo,
 static struct property_editor *property_editor_new(void)
 {
   struct property_editor *pe;
-  GtkWidget *notebook, *button, *label, *combo;
-  GtkWidget *hbox, *vbox;
+  GtkWidget *notebook, *button, *label, *combo, *image;
+  GtkWidget *hbox, *vbox, *hbox2, *evbox;
   GtkSizeGroup *sizegroup;
-  int objtype;
+  int objtype, w, h;
   const char *name;
 
   pe = fc_calloc(1, sizeof(*pe));
+  pe->tooltips = gtk_tooltips_new();
 
   hbox = gtk_hbox_new(FALSE, 4);
   pe->widget = hbox;
 
+
+  /* Insert into bottom notebook with custom label. */
+
+  hbox2 = gtk_hbox_new(FALSE, 0);
+
   label = gtk_label_new(_("Property Editor"));
+  gtk_misc_set_alignment(GTK_MISC(label), 0.0, 0.5);
+  gtk_misc_set_padding(GTK_MISC(label), 4, 0);
+  gtk_box_pack_start(GTK_BOX(hbox2), label, TRUE, TRUE, 0);
+
+  button = gtk_button_new();
+  gtk_button_set_relief(GTK_BUTTON(button), GTK_RELIEF_NONE);
+  gtk_icon_size_lookup(GTK_ICON_SIZE_MENU, &w, &h);
+  gtk_widget_set_size_request(button, w, h);
+  gtk_tooltips_set_tip(pe->tooltips, button, _("Close Tab"), "");
+  g_signal_connect_swapped(button, "clicked",
+      G_CALLBACK(gtk_widget_hide_on_delete), pe->widget);
+  gtk_box_pack_start(GTK_BOX(hbox2), button, FALSE, FALSE, 0);
+
+  image = gtk_image_new_from_stock(GTK_STOCK_CLOSE, GTK_ICON_SIZE_MENU);
+  gtk_container_add(GTK_CONTAINER(button), image);
+
+  gtk_widget_show_all(hbox2);
+
   gtk_notebook_append_page(GTK_NOTEBOOK(bottom_notebook),
-                           hbox, label);
+                           pe->widget, hbox2);
+
+  /* Property pages. */
 
   notebook = gtk_notebook_new();
   gtk_notebook_set_show_tabs(GTK_NOTEBOOK(notebook), FALSE);
@@ -4173,25 +4412,17 @@ static struct property_editor *property_editor_new(void)
     property_editor_add_page(pe, objtype);
   }
 
+  /* Page switching combobox and controlling buttons. */
+
   vbox = gtk_vbox_new(FALSE, 8);
   gtk_container_set_border_width(GTK_CONTAINER(vbox), 4);
   gtk_box_pack_start(GTK_BOX(hbox), vbox, FALSE, FALSE, 0);
 
   sizegroup = gtk_size_group_new(GTK_SIZE_GROUP_BOTH);
 
-  button = gtk_button_new_from_stock(GTK_STOCK_APPLY);
-  gtk_size_group_add_widget(sizegroup, button);
-  g_signal_connect(button, "clicked",
-                   G_CALLBACK(property_editor_apply_button_clicked), pe);
-  gtk_box_pack_start(GTK_BOX(vbox), button, FALSE, FALSE, 0);
-
-  button = gtk_button_new_from_stock(GTK_STOCK_REFRESH);
-  gtk_size_group_add_widget(sizegroup, button);
-  g_signal_connect(button, "clicked",
-                   G_CALLBACK(property_editor_refresh_button_clicked), pe);
-  gtk_box_pack_start(GTK_BOX(vbox), button, FALSE, FALSE, 0);
-
+  /* Upper buttons/combobox. */
   combo = gtk_combo_box_new_text();
+  gtk_size_group_add_widget(sizegroup, combo);
   for (objtype = 0; objtype < NUM_OBJTYPES; objtype++) {
     name = property_page_get_name(pe->property_pages[objtype]);
     if (!name) {
@@ -4199,18 +4430,38 @@ static struct property_editor *property_editor_new(void)
     }
     gtk_combo_box_append_text(GTK_COMBO_BOX(combo), name);
   }
-
   g_signal_connect(combo, "changed",
                    G_CALLBACK(property_editor_combo_changed), pe);
-  gtk_size_group_add_widget(sizegroup, combo);
-  gtk_box_pack_start(GTK_BOX(vbox), combo, FALSE, FALSE, 24);
+  evbox = gtk_event_box_new();
+  gtk_tooltips_set_tip(pe->tooltips, evbox,
+      _("This shows the current property page in the property editor. "
+        "You can also change pages by selecting one from the list."), "");
+  gtk_container_add(GTK_CONTAINER(evbox), combo);
+  gtk_box_pack_start(GTK_BOX(vbox), evbox, FALSE, FALSE, 0);
   pe->combo = combo;
 
-  button = gtk_button_new_from_stock(GTK_STOCK_CLOSE);
+  /* Lower buttons. */
+  button = gtk_button_new_from_stock(GTK_STOCK_APPLY);
   gtk_size_group_add_widget(sizegroup, button);
-  g_signal_connect_swapped(button, "clicked",
-                           G_CALLBACK(gtk_widget_hide_on_delete), pe->widget);
+  gtk_tooltips_set_tip(pe->tooltips, button,
+      _("Pressing this button will send all modified properties of "
+        "the objects selected in the object list to the server. "
+        "Modified properties' names are shown in red in the properties "
+        "panel."), "");
+  g_signal_connect(button, "clicked",
+                   G_CALLBACK(property_editor_apply_button_clicked), pe);
   gtk_box_pack_end(GTK_BOX(vbox), button, FALSE, FALSE, 0);
+
+  button = gtk_button_new_from_stock(GTK_STOCK_REFRESH);
+  gtk_size_group_add_widget(sizegroup, button);
+  gtk_tooltips_set_tip(pe->tooltips, button,
+      _("Pressing this button will reset all modified properties of "
+        "the selected objects to their current values (the values "
+        "they have on the server)."), "");
+  g_signal_connect(button, "clicked",
+                   G_CALLBACK(property_editor_refresh_button_clicked), pe);
+  gtk_box_pack_end(GTK_BOX(vbox), button, FALSE, FALSE, 0);
+
 
   gtk_widget_show_all(pe->widget);
 
@@ -4327,19 +4578,17 @@ void property_editor_clear(struct property_editor *pe)
 }
 
 /****************************************************************************
-  Clear the player property page, load the current game players into it, and
-  make it the current shown notebook page.
+  Clear and load objects into the property page corresponding to the given
+  object type. Also, make it the current shown notebook page.
 ****************************************************************************/
-void property_editor_reload_players(struct property_editor *pe)
+void property_editor_reload(struct property_editor *pe, int objtype)
 {
-  int objtype;
   struct property_page *pp;
 
   if (!pe) {
     return;
   }
 
-  objtype = OBJTYPE_PLAYER;
   pp = pe->property_pages[objtype];
   if (!pp) {
     return;
@@ -4347,9 +4596,18 @@ void property_editor_reload_players(struct property_editor *pe)
 
   property_page_clear_objbinds(pp);
 
-  players_iterate(pplayer) {
-    property_page_add_objbind(pp, pplayer);
-  } players_iterate_end;
+  switch (objtype) {
+  case OBJTYPE_PLAYER:
+    players_iterate(pplayer) {
+      property_page_add_objbind(pp, pplayer);
+    } players_iterate_end;
+    break;
+  case OBJTYPE_GAME:
+    property_page_add_objbind(pp, &game);
+    break;
+  default:
+    break;
+  }
 
   property_page_fill_widgets(pp);
   gtk_notebook_set_current_page(GTK_NOTEBOOK(pe->notebook), objtype);
@@ -4359,4 +4617,168 @@ void property_editor_reload_players(struct property_editor *pe)
   gtk_combo_box_set_active(GTK_COMBO_BOX(pe->combo), objtype);
   enable_widget_callback(pe->combo,
                          G_CALLBACK(property_editor_combo_changed));
+}
+
+/****************************************************************************
+  Create a new property filter from the given filter string. Result
+  should be freed by property_filter_free when no longed needed.
+
+  The filter string is '|' ("or") separated list of '&' ("and") separated
+  lists of patterns. A pattern may be preceeded by '!' to have its result
+  negated.
+
+  NB: If you change the behaviour of this function, be sure to update
+  the filter tooltip in property_page_new.
+****************************************************************************/
+static struct property_filter *property_filter_new(const char *filter)
+{
+  struct property_filter *pf;
+  struct pf_conjunction *pfc;
+  struct pf_pattern *pfp;
+  int or_clause_count, and_clause_count;
+  char *or_clauses[PF_MAX_CLAUSES], *and_clauses[PF_MAX_CLAUSES];
+  const char *pattern;
+  int i, j;
+
+  pf = fc_calloc(1, sizeof(*pf));
+
+  if (!filter || filter[0] == '\0') {
+    return pf;
+  }
+
+  or_clause_count = get_tokens(filter, or_clauses,
+                               PF_MAX_CLAUSES,
+                               PF_DISJUNCTION_SEPARATOR);
+
+  for (i = 0; i < or_clause_count; i++) {
+    if (or_clauses[i][0] == '\0') {
+      continue;
+    }
+    pfc = &pf->disjunction[pf->count];
+
+    and_clause_count = get_tokens(or_clauses[i], and_clauses,
+                                  PF_MAX_CLAUSES,
+                                  PF_CONJUNCTION_SEPARATOR);
+
+    for (j = 0; j < and_clause_count; j++) {
+      if (and_clauses[j][0] == '\0') {
+        continue;
+      }
+      pfp = &pfc->conjunction[pfc->count];
+      pattern = and_clauses[j];
+
+      switch (pattern[0]) {
+      case '!':
+        pfp->negate = TRUE;
+        pfp->text = mystrdup(pattern + 1);
+        break;
+      default:
+        pfp->text = mystrdup(pattern);
+        break;
+      }
+      pfc->count++;
+    }
+    free_tokens(and_clauses, and_clause_count);
+    pf->count++;
+  }
+
+  free_tokens(or_clauses, or_clause_count);
+
+  return pf;
+}
+
+/****************************************************************************
+  Returns TRUE if the filter matches the given object property.
+
+  The filter matches if its truth value is TRUE. That is, it has at least
+  one OR clause in which all AND clauses are TRUE. An AND clause is TRUE
+  if its pattern matches the name of the given object property (case is
+  ignored), or it is negated and does not match. For example:
+
+  a     - Matches all properties whose names contain "a" (or "A").
+  !a    - Matches all properties whose names do not contain "a".
+  a|b   - Matches all properties whose names contain "a" or "b".
+  a|b&c - Matches all properties whose names contain either an "a",
+          or contain both "b" and "c".
+
+  NB: If you change the behaviour of this function, be sure to update
+  the filter tooltip in property_page_new.
+****************************************************************************/
+static bool property_filter_match(struct property_filter *pf,
+                                  const struct objprop *op)
+{
+  struct pf_pattern *pfp;
+  struct pf_conjunction *pfc;
+  const char *name;
+  bool match, or_result, and_result;
+  int i, j;
+
+  if (!pf) {
+    return TRUE;
+  }
+  if (!op) {
+    return FALSE;
+  }
+
+  name = objprop_get_name(op);
+  if (!name) {
+    return FALSE;
+  }
+
+  if (pf->count < 1) {
+    return TRUE;
+  }
+
+  or_result = FALSE;
+
+  for (i = 0; i < pf->count; i++) {
+    pfc = &pf->disjunction[i];
+    and_result = TRUE;
+    for (j = 0; j < pfc->count; j++) {
+      pfp = &pfc->conjunction[j];
+      match = (pfp->text[0] == '\0'
+               || mystrcasestr(name, pfp->text));
+      if (pfp->negate) {
+        match = !match;
+      }
+      and_result = and_result && match;
+      if (!and_result) {
+        break;
+      }
+    }
+    or_result = or_result || and_result;
+    if (or_result) {
+      break;
+    }
+  }
+
+  return or_result;
+}
+
+/****************************************************************************
+  Frees all memory used by the property filter.
+****************************************************************************/
+static void property_filter_free(struct property_filter *pf)
+{
+  struct pf_pattern *pfp;
+  struct pf_conjunction *pfc;
+  int i, j;
+
+  if (!pf) {
+    return;
+  }
+
+  for (i = 0; i < pf->count; i++) {
+    pfc = &pf->disjunction[i];
+    for (j = 0; j < pfc->count; j++) {
+      pfp = &pfc->conjunction[j];
+      if (pfp->text != NULL) {
+        free(pfp->text);
+        pfp->text = NULL;
+      }
+    }
+    pfc->count = 0;
+  }
+  pf->count = 0;
+  free(pf);
 }

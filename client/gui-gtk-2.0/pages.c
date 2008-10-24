@@ -988,11 +988,10 @@ static void start_start_callback(GtkWidget *w, gpointer data)
 **************************************************************************/
 static void pick_nation_callback(GtkWidget *w, gpointer data)
 {
-  if (NULL != client.conn.playing) {
-    popup_races_dialog(client.conn.playing);
+  if (can_client_control()) {
+    popup_races_dialog(client_player());
   } else if (game.info.is_new_game) {
     send_chat("/take -");
-    popup_races_dialog(NULL);
   }
 }
 
@@ -1139,7 +1138,8 @@ static void show_conn_popup(struct player *pplayer, struct connection *pconn)
 
   /* Show popup. */
   popup = gtk_message_dialog_new(NULL, 0,
-				 GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE, buf);
+				 GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+				 "%s", buf);
   gtk_window_set_title(GTK_WINDOW(popup), _("Player/conn info"));
   setup_dialog(popup, toplevel);
   g_signal_connect(popup, "response", G_CALLBACK(gtk_widget_destroy), NULL);
